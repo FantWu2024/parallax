@@ -16,13 +16,14 @@ Two classes that handles a post request from the frontend service:
 import asyncio
 import json
 import multiprocessing as mp
+import re
 import sys
 import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fastapi
 import uvicorn
@@ -40,6 +41,106 @@ from parallax.utils.utils import get_zmq_socket
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+class ToolCallParser:
+    """
+    Parse <tool_call>...</tool_call> tags from model output,
+    and convert them to OpenAI-compatible tool_calls format.
+    """
+    
+    # Match complete <tool_call>...</tool_call> tags
+    TOOL_CALL_PATTERN = re.compile(
+        r'<tool_call>\s*(\{.*?\})\s*</tool_call>',
+        re.DOTALL
+    )
+    
+    def __init__(self):
+        self.buffer = ""  # Accumulated text buffer
+        self.tool_calls: List[Dict] = []  # Parsed tool calls
+        self.tool_call_counter = 0  # Tool call ID counter
+        self.has_tool_call = False  # Whether a tool call was detected
+        self.in_tool_call = False  # Whether inside a tool_call tag
+    
+    def add_token(self, token: str) -> Tuple[str, Optional[Dict]]:
+        """
+        Add a token, return (text_to_send, tool_call_or_none)
+        - text_to_send: Content to send as plain text (may be empty string)
+        - tool_call_or_none: If a complete tool_call is parsed, return the tool_call dict
+        """
+        self.buffer += token
+        
+        # Detect <tool_call> opening tag
+        if '<tool_call>' in self.buffer and not self.in_tool_call:
+            self.in_tool_call = True
+            self.has_tool_call = True
+            # Extract text before <tool_call>
+            idx = self.buffer.find('<tool_call>')
+            text_before = self.buffer[:idx]
+            self.buffer = self.buffer[idx:]  # Keep the part starting from <tool_call>
+            return text_before, None
+        
+        # If inside tool_call tag, detect closing tag
+        if self.in_tool_call:
+            if '</tool_call>' in self.buffer:
+                # Parse complete tool_call
+                match = self.TOOL_CALL_PATTERN.search(self.buffer)
+                if match:
+                    try:
+                        tool_call_json = json.loads(match.group(1))
+                        self.tool_call_counter += 1
+                        tool_call = {
+                            "index": len(self.tool_calls),
+                            "id": f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_call_json.get("name", ""),
+                                "arguments": json.dumps(tool_call_json.get("arguments", {}))
+                            }
+                        }
+                        self.tool_calls.append(tool_call)
+                        # Clear the parsed part
+                        end_idx = self.buffer.find('</tool_call>') + len('</tool_call>')
+                        self.buffer = self.buffer[end_idx:]
+                        self.in_tool_call = False
+                        return "", tool_call
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[ToolCallParser] Failed to parse tool_call JSON: {e}")
+                        # Parse failed, treat as plain text
+                        self.in_tool_call = False
+                        text = self.buffer
+                        self.buffer = ""
+                        return text, None
+            # Still waiting for closing tag, don't send anything
+            return "", None
+        
+        # If potentially the start of <tool_call>, buffer it
+        if '<' in self.buffer:
+            # Check if it might be the start of <tool_call>
+            partial_patterns = ['<t', '<to', '<too', '<tool', '<tool_', '<tool_c', 
+                              '<tool_ca', '<tool_cal', '<tool_call', '<tool_call>']
+            for pattern in partial_patterns:
+                if self.buffer.endswith(pattern):
+                    # Might be start of tag, buffer and don't send
+                    idx = self.buffer.rfind('<')
+                    text_before = self.buffer[:idx]
+                    self.buffer = self.buffer[idx:]
+                    return text_before, None
+        
+        # Plain text, send directly
+        text = self.buffer
+        self.buffer = ""
+        return text, None
+    
+    def flush(self) -> str:
+        """Flush the buffer and return remaining text"""
+        text = self.buffer
+        self.buffer = ""
+        return text
+    
+    def get_finish_reason(self) -> str:
+        """Return finish_reason based on whether there are tool_calls"""
+        return "tool_calls" if self.tool_calls else "stop"
 
 
 def get_exception_traceback():
@@ -252,27 +353,121 @@ class HTTPHandler:
         response_json = json.dumps(response, separators=(",", ":"))
         return f"data: {response_json}\n\n".encode()
 
+    def _generate_tool_call_chunk(self, rid, tool_call: Dict, is_first: bool = False):
+        """Generates a SSE chunk for a tool call (OpenAI-compatible format)."""
+        request_info = self.processing_requests[rid]
+        
+        delta = {"tool_calls": [tool_call]}
+        if is_first:
+            delta["role"] = "assistant"
+        
+        response = {
+            "id": rid,
+            "object": "chat.completion.chunk",
+            "created": int(request_info.create_time),
+            "model": request_info.model,
+            "system_fingerprint": "fp_parallax",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": None,
+                },
+            ],
+        }
+        response_json = json.dumps(response, separators=(",", ":"))
+        return f"data: {response_json}\n\n".encode()
+
+    def _generate_final_chunk(self, rid, finish_reason: str):
+        """Generates the final SSE chunk with finish_reason."""
+        request_info = self.processing_requests[rid]
+        response = {
+            "id": rid,
+            "object": "chat.completion.chunk",
+            "created": int(request_info.create_time),
+            "model": request_info.model,
+            "system_fingerprint": "fp_parallax",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                },
+            ],
+        }
+        # Add probs in the final chunk if requested
+        if request_info.return_probs:
+            response["choices"][0]["probs"] = [
+                {self.tokenizer.decode([token_id]): prob}
+                for token_id, prob in zip(request_info.token_ids_list, request_info.probs_list)
+            ]
+            response["choices"][0]["token_ids"] = request_info.token_ids_list
+        if request_info.weight_version is not None:
+            response["weight_version"] = request_info.weight_version
+        response_json = json.dumps(response, separators=(",", ":"))
+        return f"data: {response_json}\n\n".encode()
+
     async def generate_stream_response(self, rid):
         """Generates a streaming response by consuming from a token queue."""
         # Send first chunk with role
+        logger.info(f"[HTTP_SERVER] Starting stream for {rid}")
         yield self._generate_stream_chunk(rid, None, is_first=True)
 
         request_info = self.processing_requests.get(rid)
         if not request_info or not request_info.stream:
+            logger.warning(f"[HTTP_SERVER] No request_info or not stream for {rid}")
             return
 
+        token_count = 0
+        tool_parser = ToolCallParser()  # For parsing tool_call tags
+        first_tool_call = True  # First tool_call chunk needs to include role
+        
+        logger.info(f"[HTTP_SERVER] Waiting for tokens for {rid}...")
         while True:
             token = await request_info.token_queue.get()
+            
             if token is None:  # End of stream sentinel
+                print()  # Newline
+                logger.info(f"[HTTP_SERVER] End sentinel received for {rid}, total tokens={token_count}")
+                # Flush parser buffer
+                remaining_text = tool_parser.flush()
+                if remaining_text:
+                    yield self._generate_stream_chunk(rid, remaining_text)
                 break
             if isinstance(token, dict) and token.get("type") == "error":
+                logger.error(f"[HTTP_SERVER] Error token received for {rid}: {token}")
                 yield self._generate_error_stream_chunk(rid, token.get("payload", {}))
                 continue
-            yield self._generate_stream_chunk(rid, token)
+            
+            token_count += 1
+            # Print token content in streaming mode
+            print(token, end='', flush=True)
+            
+            # Use ToolCallParser to parse token
+            text_to_send, tool_call = tool_parser.add_token(token)
+            
+            # Send plain text
+            if text_to_send:
+                yield self._generate_stream_chunk(rid, text_to_send)
+            
+            # Send tool_call
+            if tool_call:
+                logger.info(f"[HTTP_SERVER] Tool call detected: {tool_call['function']['name']}")
+                yield self._generate_tool_call_chunk(rid, tool_call, is_first=first_tool_call)
+                first_tool_call = False
 
+        # Set finish_reason based on whether there are tool_calls
+        finish_reason = tool_parser.get_finish_reason()
+        request_info.finish_reason = finish_reason
+        
+        if tool_parser.tool_calls:
+            logger.info(f"[HTTP_SERVER] Stream finished with {len(tool_parser.tool_calls)} tool calls")
+        
         # Send final chunk with finish reason
-        yield self._generate_stream_chunk(rid, None, is_last=True)
+        logger.info(f"[HTTP_SERVER] Streaming complete for {rid}, finish_reason={finish_reason}")
+        yield self._generate_final_chunk(rid, finish_reason)
         yield b"data: [DONE]\n\n"
+        logger.info(f"[HTTP_SERVER] [DONE] sent for {rid}")
 
     def generate_non_stream_response(self, rid):
         """Generates a non-streaming response"""
